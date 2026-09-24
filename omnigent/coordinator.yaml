@@ -71,7 +71,21 @@ os_env:
     type: linux_bwrap
     write_paths:
       - .
-    allow_network: false
+    # ".git" is masked (hidden/emptied) inside the sandbox by default like
+    # any other top-level dotdir - without this, git sees a fresh, empty
+    # repo on every single shell call and nothing persists between them.
+    cwd_allow_hidden:
+      - .git
+    # Needed for git fetch/push (and gh) to actually reach github.com -
+    # the ask_on_os_tools policy is still the safety gate here: it already
+    # pauses for approval before any shell command runs, network or not.
+    allow_network: true
+    # $HOME is never mounted into the sandbox, so gh's stored credentials
+    # (~/.config/gh/hosts.yml) aren't reachable - GH_TOKEN as an env var
+    # is what gh/git's credential helper check instead. Set GH_TOKEN in
+    # .env (see RUNBOOK.md) for this to actually authenticate.
+    env_passthrough:
+      - GH_TOKEN
 
 tools:
   read_contract:
