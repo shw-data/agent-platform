@@ -156,39 +156,17 @@ def run_validation(entity: str, source_table: str) -> dict:
     }
 
 
-def generate_notebook_code(
-    entity: str,
-    source_table: str,
-    existing_code: str = None,
-    validation_errors: list = None,
-) -> str:
-    """Generate transformation code for an entity via the Notebook Agent (1 LLM call).
+def build_canonical_spec(entity: str) -> dict:
+    """Merge an entity's contract/schema/mapping/model into one canonical
+    spec, e.g. build_canonical_spec("customer").
 
-    Returns the generated Python source as a string - call write_notebook()
-    separately to persist it. Pass existing_code + validation_errors (as
-    returned by run_validation()'s "errors" list) to ask for a fix instead
-    of a from-scratch generation.
+    Pure deterministic merge, no LLM involved - cross-references the four
+    YAMLs to resolve each field's required/unique/allowed_values/format/
+    constraint/cast/transform in one place, so nothing downstream has to
+    re-derive that from four separate files itself.
     """
-    from agents.notebook_agent import generate_notebook
     from orchestrator.canonical_spec import build_canonical_specification
     from orchestrator.config import spec_paths
-    from validation.rules import ValidationError
 
     spec = build_canonical_specification(**spec_paths(entity))
-    if validation_errors and not isinstance(validation_errors[0], dict):
-        raise TypeError(
-            "validation_errors must be the exact 'errors' list from run_validation() "
-            f"(a list of {{'rule','field','message'}} objects), not {type(validation_errors[0]).__name__} items"
-        )
-    errors = (
-        [ValidationError(**e) for e in validation_errors]
-        if validation_errors
-        else None
-    )
-    return generate_notebook(
-        spec,
-        source_table=source_table,
-        target_table=spec.target_name,
-        existing_code=existing_code,
-        validation_errors=errors,
-    )
+    return spec.to_dict()

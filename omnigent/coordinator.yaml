@@ -15,9 +15,11 @@ prompt: |
 
   Given an entity name (e.g. "customer"), do the following:
 
-  1. Read its four spec files: read_contract, read_schema, read_mapping,
-     read_model (all take just the entity name). If any is missing, tell the
-     human which file is missing and stop - do not invent one.
+  1. Call build_canonical_spec(entity) - this merges the contract, schema,
+     mapping, and model into one spec (deterministic, no LLM involved). If
+     it errors because a file is missing, use read_contract/read_schema/
+     read_mapping/read_model individually to pinpoint which one, tell the
+     human, and stop - do not invent a missing file.
 
   2. Determine the raw source table name. For entities added going forward,
      this is just the entity name itself (e.g. "product" -> raw table
@@ -26,8 +28,11 @@ prompt: |
      run_duckdb("SHOW TABLES") to find the actual raw table, and ask the
      human if it's still ambiguous.
 
-  3. Call generate_notebook_code(entity, source_table) to draft the
-     transformation code, then write_notebook(entity, code) to save it.
+  3. Delegate to the notebook_drafter sub-agent to draft the transformation
+     code: send it the canonical spec (as JSON) plus the source and target
+     table names, and ask it to write the transformation script. It returns
+     raw code, sometimes wrapped in ```python fences - strip those before
+     using it. Call write_notebook(entity, code) to save what it returns.
 
   4. Call run_validation(entity, source_table) to check it deterministically
      (this makes zero LLM calls - it is the authoritative pass/fail, not your
@@ -35,9 +40,11 @@ prompt: |
 
   5. If validation fails:
      - If this looks like a code-level bug (e.g. a crash, a type mismatch,
-       a missing TRY_CAST), call generate_notebook_code again, passing the
-       previous code as existing_code and the errors list from run_validation
-       as validation_errors, then write_notebook and re-validate.
+       a missing TRY_CAST), delegate to notebook_drafter again in the SAME
+       sub-agent session if possible (so it has the conversation context of
+       what it wrote and why it failed) - send it the current code plus the
+       errors list from run_validation, and ask it to return the full
+       corrected script. Strip fences, write_notebook, and re-validate.
      - Retry at most 3 times total for one entity.
      - If the SAME rule keeps failing across attempts, or an error looks like
        a genuine gap in the contract/mapping rather than a code bug (e.g. a
@@ -56,7 +63,8 @@ prompt: |
      merge.
 
   Never bypass run_validation's verdict - it is deterministic and
-  authoritative. Your own read of the code is advisory only.
+  authoritative. Neither your own read of the code nor notebook_drafter's
+  own confidence in it are authoritative - only run_validation's result is.
 
 executor:
   harness: claude-sdk
@@ -128,33 +136,54 @@ tools:
     description: Run the deterministic validation rules for an entity against its already-generated notebook output. Zero LLM calls - this is the authoritative pass/fail.
     callable: tools.tools.run_validation
 
-  generate_notebook_code:
+  build_canonical_spec:
     type: function
-    description: Draft (or fix) an entity's transformation notebook code via the Notebook Agent. Returns code as a string - call write_notebook separately to save it.
-    callable: tools.tools.generate_notebook_code
-    parameters:
-      type: object
-      properties:
-        entity:
-          type: string
-        source_table:
-          type: string
-        existing_code:
-          type: string
-        validation_errors:
-          type: array
-          description: Pass the exact "errors" list returned by run_validation, unmodified - each item is an object with rule, field, and message.
-          items:
-            type: object
-            properties:
-              rule:
-                type: string
-              field:
-                type: [string, "null"]
-              message:
-                type: string
-            required: [rule, field, message]
-      required: [entity, source_table]
+    description: Merge an entity's contract, schema, mapping, and model into one canonical spec. Deterministic, zero LLM calls - the single source of truth to hand to notebook_drafter.
+    callable: tools.tools.build_canonical_spec
+
+  notebook_drafter:
+    type: agent
+    description: >-
+      Drafts (or fixes) DuckDB transformation code from a canonical spec.
+      Send it the spec JSON plus source/target table names to draft from
+      scratch, or the current code plus validation errors to ask for a fix.
+      Narrow and stateless by design - it never decides pass/fail, and it
+      never invents casts/transforms beyond what the spec says.
+    prompt: |
+      You are a data engineering code generator. You write a single,
+      self-contained Python script that uses the duckdb module to transform
+      a source table into a target table inside a local DuckDB database
+      file.
+
+      Rules:
+      - Connect to the DuckDB database at "data/warehouse.duckdb".
+      - Read from the source table and write the result into the target
+        table using `CREATE OR REPLACE TABLE <target> AS SELECT ...`.
+      - Apply exactly the transform/cast specified for each field in the
+        canonical spec you are given - do not invent your own casts or
+        transforms.
+      - The "lowercase" transform means SQL LOWER(column).
+      - The "cast_date" transform means casting the source string to DATE.
+      - The "none" transform means passing the column through unchanged
+        (still apply the given `cast` type).
+      - If a cast could fail on a malformed source value (e.g. a date
+        string not in YYYY-MM-DD format), use TRY_CAST instead of CAST for
+        that column, so the row gets NULL in that column instead of the
+        whole script crashing. Do not add any other error handling,
+        filtering, or logging beyond this.
+      - Close the connection at the end.
+      - Output ONLY the raw Python source code. No markdown fences, no
+        explanation, no comments about what you changed.
+
+      You'll be asked in one of two ways:
+      - "Generate from scratch": you're given the canonical spec JSON plus
+        source/target table names. Write the script.
+      - "Fix these errors": you're given the previous code plus a list of
+        validation errors (each an object with rule/field/message). Return
+        the FULL corrected script that fixes every error while continuing
+        to satisfy the canonical spec - not just a diff or partial edit.
+    executor:
+      harness: claude-sdk
 
 policies:
   approve_shell:
