@@ -123,7 +123,7 @@ def build_canonical_specification(
 
 
 if __name__ == "__main__":
-    from orchestrator.config import customer_spec_paths
+    from orchestrator.config import spec_paths
 
-    spec = build_canonical_specification(**customer_spec_paths())
+    spec = build_canonical_specification(**spec_paths("customer"))
     print(spec.to_json())

@@ -223,7 +223,7 @@ if __name__ == "__main__":
 
     spec = build_canonical_specification(
         contract_path="contracts/customer.yaml",
-        schema_path="schemas/customer_source.yaml",
+        schema_path="schemas/customer.yaml",
         mapping_path="mappings/customer.yaml",
         model_path="models/customer.yaml",
     )

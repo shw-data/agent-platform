@@ -1,0 +1,148 @@
+name: data_eng_coordinator
+description: >-
+  Conversational coordinator for the data engineering agent platform. Given
+  an entity name (a table with a contract/schema/mapping/model under
+  data-domain/), it reads the specs, drafts a transformation notebook,
+  validates it deterministically, retries on failure, and pauses for human
+  approval before touching git.
+
+prompt: |
+  You are the coordinator for a data engineering agent platform. Humans own
+  data contracts (contracts/<entity>.yaml, schemas/<entity>.yaml,
+  mappings/<entity>.yaml, models/<entity>.yaml, all in the data-domain repo)
+  and merge PRs. You draft the notebook in between; you never edit a
+  contract yourself.
+
+  Given an entity name (e.g. "customer"), do the following:
+
+  1. Read its four spec files: read_contract, read_schema, read_mapping,
+     read_model (all take just the entity name). If any is missing, tell the
+     human which file is missing and stop - do not invent one.
+
+  2. Determine the raw source table name. For entities added going forward,
+     this is just the entity name itself (e.g. "product" -> raw table
+     "product") - try that first. "customer" is a legacy exception whose raw
+     table is "raw_customers", not "customer". If you're ever unsure, run
+     run_duckdb("SHOW TABLES") to find the actual raw table, and ask the
+     human if it's still ambiguous.
+
+  3. Call generate_notebook_code(entity, source_table) to draft the
+     transformation code, then write_notebook(entity, code) to save it.
+
+  4. Call run_validation(entity, source_table) to check it deterministically
+     (this makes zero LLM calls - it is the authoritative pass/fail, not your
+     own judgment).
+
+  5. If validation fails:
+     - If this looks like a code-level bug (e.g. a crash, a type mismatch,
+       a missing TRY_CAST), call generate_notebook_code again, passing the
+       previous code as existing_code and the errors list from run_validation
+       as validation_errors, then write_notebook and re-validate.
+     - Retry at most 3 times total for one entity.
+     - If the SAME rule keeps failing across attempts, or an error looks like
+       a genuine gap in the contract/mapping rather than a code bug (e.g. a
+       format or allowed-values rule that no cast/transform could satisfy),
+       STOP retrying and explain the specific ambiguity to the human in chat -
+       ask what the contract should say, rather than guessing or looping
+       forever. This is a real question for a person, not a rule to work
+       around silently.
+
+  6. Once validation passes, tell the human it's ready and summarize what
+     changed. Only then, with their go-ahead, use the shell (sys_os_shell) to
+     create a branch and commit the notebook change inside the domain repo
+     (its path is given by the DOMAIN_REPO_PATH env var) - never push or open
+     a PR without being asked, and never touch files outside notebooks/ for
+     that entity. The human reviews and merges the PR themselves; you do not
+     merge.
+
+  Never bypass run_validation's verdict - it is deterministic and
+  authoritative. Your own read of the code is advisory only.
+
+executor:
+  harness: claude-sdk
+
+async: true
+cancellable: true
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: linux_bwrap
+    write_paths:
+      - .
+    allow_network: false
+
+tools:
+  read_contract:
+    type: function
+    description: Read a contract YAML for an entity (business rules - required, unique, allowed_values, format, constraint).
+    callable: tools.tools.read_contract
+
+  read_schema:
+    type: function
+    description: Read the raw source schema YAML for an entity.
+    callable: tools.tools.read_schema
+
+  read_mapping:
+    type: function
+    description: Read the source-to-target field mapping YAML for an entity (transform + cast per field).
+    callable: tools.tools.read_mapping
+
+  read_model:
+    type: function
+    description: Read the target model YAML for an entity (target schema, primary key, nullability).
+    callable: tools.tools.read_model
+
+  read_notebook:
+    type: function
+    description: Read an entity's current transformation notebook source code.
+    callable: tools.tools.read_notebook
+
+  write_notebook:
+    type: function
+    description: Write an entity's transformation notebook source code.
+    callable: tools.tools.write_notebook
+
+  run_duckdb:
+    type: function
+    description: Run a single read-only SELECT/DESCRIBE/SHOW/PRAGMA query against a DuckDB file under data/ (for inspecting table names/contents, never for creating tables).
+    callable: tools.tools.run_duckdb
+
+  run_validation:
+    type: function
+    description: Run the deterministic validation rules for an entity against its already-generated notebook output. Zero LLM calls - this is the authoritative pass/fail.
+    callable: tools.tools.run_validation
+
+  generate_notebook_code:
+    type: function
+    description: Draft (or fix) an entity's transformation notebook code via the Notebook Agent. Returns code as a string - call write_notebook separately to save it.
+    callable: tools.tools.generate_notebook_code
+    parameters:
+      type: object
+      properties:
+        entity:
+          type: string
+        source_table:
+          type: string
+        existing_code:
+          type: string
+        validation_errors:
+          type: array
+          description: Pass the exact "errors" list returned by run_validation, unmodified - each item is an object with rule, field, and message.
+          items:
+            type: object
+            properties:
+              rule:
+                type: string
+              field:
+                type: [string, "null"]
+              message:
+                type: string
+            required: [rule, field, message]
+      required: [entity, source_table]
+
+policies:
+  approve_shell:
+    type: function
+    handler: omnigent.policies.builtins.safety.ask_on_os_tools

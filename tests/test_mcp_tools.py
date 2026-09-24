@@ -9,7 +9,7 @@ Run with: python -m tests.test_mcp_tools
 """
 import duckdb
 
-from mcp.tools import (
+from tools.tools import (
     ToolAccessError,
     read_contract,
     read_mapping,
@@ -27,9 +27,9 @@ contract = read_contract("customer")
 assert contract["name"] == "customer"
 print(f"read_contract('customer'): OK ({len(contract['requirements'])} requirements)")
 
-schema = read_schema("customer_source")
-assert schema["name"] == "customer_source"
-print(f"read_schema('customer_source'): OK ({len(schema['columns'])} columns)")
+schema = read_schema("customer")
+assert schema["name"] == "customer"
+print(f"read_schema('customer'): OK ({len(schema['columns'])} columns)")
 
 mapping = read_mapping("customer")
 assert mapping["name"] == "customer_mapping"
@@ -39,23 +39,23 @@ model = read_model("customer")
 assert model["name"] == "customer_target"
 print(f"read_model('customer'): OK ({len(model['columns'])} columns)")
 
-code = read_notebook("customer_transformation")
+code = read_notebook("customer")
 assert "duckdb" in code
-print(f"read_notebook('customer_transformation'): OK ({len(code)} chars)")
+print(f"read_notebook('customer'): OK ({len(code)} chars)")
 
 write_notebook("_scratch_roundtrip_test", "# scratch\nprint('hello')\n")
 roundtrip = read_notebook("_scratch_roundtrip_test")
 assert roundtrip == "# scratch\nprint('hello')\n"
 from orchestrator.config import DOMAIN_REPO
-(DOMAIN_REPO / "notebooks" / "_scratch_roundtrip_test.py").unlink()
+(DOMAIN_REPO / "notebooks" / "_scratch_roundtrip_test_transformation.py").unlink()
 print("write_notebook -> read_notebook round-trip: OK")
 
 rows = run_duckdb("SELECT COUNT(*) AS n FROM raw_customers")
 assert rows[0]["n"] == 30
 print(f"run_duckdb(SELECT COUNT...): OK ({rows[0]['n']} rows)")
 
-report = run_validation()
-print(f"run_validation(): OK (passed={report['passed']}, {len(report['errors'])} error(s))")
+report = run_validation("customer", "raw_customers")
+print(f"run_validation('customer', 'raw_customers'): OK (passed={report['passed']}, {len(report['errors'])} error(s))")
 
 print("\n--- Guardrail checks (these MUST raise) ---")
 

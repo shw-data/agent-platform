@@ -110,9 +110,9 @@ def explain_report(report: ValidationReport) -> str:
 
 if __name__ == "__main__":
     from orchestrator.canonical_spec import build_canonical_specification
-    from orchestrator.config import customer_spec_paths, domain_path
+    from orchestrator.config import spec_paths, domain_path
 
-    spec = build_canonical_specification(**customer_spec_paths())
+    spec = build_canonical_specification(**spec_paths("customer"))
 
     report = validate_notebook(
         spec, notebook_path=domain_path("notebooks/customer_transformation.py")

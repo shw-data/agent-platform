@@ -25,10 +25,11 @@ def domain_path(*parts: str) -> str:
     return str(DOMAIN_REPO.joinpath(*parts))
 
 
-def customer_spec_paths() -> dict:
+def spec_paths(entity: str) -> dict:
+    """Locate the four spec files for any entity, e.g. spec_paths("customer")."""
     return {
-        "contract_path": domain_path("contracts/customer.yaml"),
-        "schema_path": domain_path("schemas/customer_source.yaml"),
-        "mapping_path": domain_path("mappings/customer.yaml"),
-        "model_path": domain_path("models/customer.yaml"),
+        "contract_path": domain_path(f"contracts/{entity}.yaml"),
+        "schema_path": domain_path(f"schemas/{entity}.yaml"),
+        "mapping_path": domain_path(f"mappings/{entity}.yaml"),
+        "model_path": domain_path(f"models/{entity}.yaml"),
     }
