@@ -241,17 +241,27 @@ PYTHONPATH=/absolute/path/to/agent-platform omnigent run /absolute/path/to/agent
 Send this message:
 > Generate and validate a transformation notebook for the customer entity.
 
-**Expected behavior**: you should see it call, in order, `read_contract`,
-`read_schema`, `read_mapping`, `read_model` (or a subset, if it already
-has context), then `generate_notebook_code`, `write_notebook`, and
-`run_validation`. It should report back the same 7 errors as Scenario 1
-(assuming a clean baseline) and correctly say these are known data-quality
-issues for a human to review — not something to keep retrying forever.
+**Expected behavior**: you should see it call `build_canonical_spec`
+(falling back to `read_contract`/`read_schema`/`read_mapping`/`read_model`
+individually only if that errors), then **delegate to the
+`notebook_drafter` sub-agent** (a real Omnigent-dispatched call, visible as
+a sub-agent session in the UI — not a plain tool call), then
+`write_notebook`, then `run_validation`. It should report back the same 7
+errors as Scenario 1 (assuming a clean baseline) and correctly say these
+are known data-quality issues for a human to review — not something to
+keep retrying forever.
 
 **If validation fails for a genuinely fixable reason** (e.g. you'd broken
-the notebook's `TRY_CAST` beforehand), it should call `generate_notebook_code`
-again with the errors, `write_notebook` the fix, and `run_validation` again
-— capped at a few attempts, not an infinite loop.
+the notebook's `TRY_CAST` beforehand), it should delegate to
+`notebook_drafter` again with the current code and the errors, get back a
+corrected script, `write_notebook` it, and `run_validation` again — capped
+at a few attempts, not an infinite loop.
+
+**Note**: unlike Scenarios 1 and 2, there's no way to test the drafting
+step itself outside a live Omnigent session — `notebook_drafter` is a
+declared sub-agent, not a plain Python function you can call directly.
+That's deliberate (see RUNBOOK.md §8.3): every LLM call in the system now
+goes through Omnigent, so this scenario is the only real test of it.
 
 ### Scenario 4 (primary) — The human-approval gate actually blocks
 
@@ -297,15 +307,22 @@ Send this message:
 > Generate and validate a transformation notebook for the product entity.
 
 **Expected behavior**: same tool sequence as Scenario 3
-(`read_contract("product")` → ... → `generate_notebook_code("product", "product")`
-→ `write_notebook` → `run_validation("product", "product")`), producing a
+(`build_canonical_spec("product")` → delegate to `notebook_drafter` →
+`write_notebook` → `run_validation("product", "product")`), producing a
 brand-new `notebooks/product_transformation.py` and reporting **5** errors:
 `required_field_not_null` (×2, `sku` and `price`), `allowed_values`
 (`status`), `uniqueness` (`product_id`), `constraint_not_in_future`
-(`launch_date`). This was confirmed to work exactly this way — including
-the agent correctly inferring `TRY_CAST`/`LOWER()` usage from the mapping's
-`transform`/`cast` fields for an entity it had never seen before — with no
-`agent-platform` code changes at all.
+(`launch_date`).
+
+`build_canonical_spec("product")` (the deterministic merge step) is
+already confirmed working — no LLM involved, verified directly. The
+drafting step itself was confirmed working under an earlier version of
+this platform that called the drafting LLM directly from Python instead
+of through a proper Omnigent sub-agent (see RUNBOOK.md §8.3 for why that
+changed) — same underlying prompt, now dispatched through
+`notebook_drafter` instead, but this specific scenario hasn't been
+re-run end-to-end against the current sub-agent architecture yet. If you
+run it and it doesn't produce exactly this, that's worth reporting.
 
 **To build your own third entity** instead of using `product`, follow the
 same shape: `contracts/<entity>.yaml`, `schemas/<entity>.yaml` (see §6 for
@@ -324,8 +341,9 @@ For any entity you add, keep this 1:1: if the entity is `product`, the
 files are `contracts/product.yaml`, `schemas/product.yaml`,
 `mappings/product.yaml`, `models/product.yaml` (no suffixes), and the raw
 source table is named `product` too. This is exactly what `product` does
-above, and it's why Scenario 5's `generate_notebook_code('product',
-'product')` call doesn't need to guess anything.
+above, and it's why Scenario 5's `build_canonical_spec('product')` call
+doesn't need to guess anything, and `run_validation('product', 'product')`
+doesn't need `run_duckdb("SHOW TABLES")` to find the source table.
 
 **`customer` is a legacy exception to this**, predating the convention:
 its raw table is `raw_customers` (prefixed and pluralized, not just

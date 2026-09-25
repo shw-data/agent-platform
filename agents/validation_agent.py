@@ -2,9 +2,10 @@
 
 Executes the generated notebook against the local DuckDB database (plain
 subprocess - no API call), then runs the deterministic validation rules
-(validation/rules.py) against the actual output. Claude is only used -
-optionally, and only on explicit request - to produce a human-readable
-explanation of failures; it never decides pass/fail.
+(validation/rules.py) against the actual output. No LLM calls anywhere in
+this module - pass/fail is entirely deterministic. Explaining a failure in
+plain language, when wanted, is the Coordinator's own job (a real Omnigent
+turn), not a separate hidden API call from here.
 """
 from __future__ import annotations
 
@@ -79,33 +80,6 @@ def validate_notebook(
         con.close()
 
     return report
-
-
-def explain_report(report: ValidationReport) -> str:
-    """Optional: ask Claude to summarize validation errors in plain language.
-
-    Not used for pass/fail - that decision is already made deterministically
-    by run_validation(). Costs an API call - call only with user confirmation.
-    """
-    from anthropic import Anthropic
-    from dotenv import load_dotenv
-
-    load_dotenv()
-    client = Anthropic()
-
-    response = client.messages.create(
-        model="claude-opus-5",
-        max_tokens=1024,
-        system=(
-            "You explain data validation failures to a data engineer in plain, "
-            "concise language. Do not add new findings - only explain the ones given."
-        ),
-        messages=[{
-            "role": "user",
-            "content": f"Explain these validation results:\n\n{report.summary()}",
-        }],
-    )
-    return "".join(b.text for b in response.content if b.type == "text")
 
 
 if __name__ == "__main__":

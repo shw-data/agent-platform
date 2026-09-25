@@ -4,6 +4,11 @@ This document is for anyone new to this project: what it is, how the pieces
 fit together, how to install and run everything from zero, and what to do
 when something breaks. It assumes no prior context.
 
+For how Omnigent itself works (the tool-calling loop, config file
+structure, production conventions), see [OMNIGENT.md](OMNIGENT.md) — this
+document is about *this project's* setup, that one is about Omnigent as a
+technology.
+
 ---
 
 ## 1. What this is, in one paragraph
@@ -106,14 +111,14 @@ flowchart TB
     end
 
     subgraph AP["agent-platform repo (platform team owns)"]
-        SPEC["orchestrator/canonical_spec.py<br/>merges the 4 YAMLs into one spec"]
-        NA["agents/notebook_agent.py<br/>1 Claude call → draft code"]
+        SPEC["orchestrator/canonical_spec.py<br/>merges the 4 YAMLs into one spec<br/>(deterministic, 0 LLM calls)"]
         VA["agents/validation_agent.py +<br/>validation/rules.py<br/>0 LLM calls, deterministic checks"]
         TOOLS["tools/tools.py<br/>guarded read/write/query functions"]
     end
 
-    subgraph OG["Omnigent (conversational + human-in-the-loop layer)"]
-        COORD["omnigent/coordinator.yaml<br/>system prompt + tool list + policy"]
+    subgraph OG["Omnigent - every LLM call, one governed system"]
+        COORD["coordinator.yaml: main agent<br/>system prompt + tool list + policy"]
+        NA["coordinator.yaml: notebook_drafter<br/>sub-agent, declared in the SAME file -<br/>dispatched &amp; tracked by Omnigent,<br/>not a hidden separate API call"]
         POLICY["ask_on_os_tools policy<br/>pauses for approval before shell/git"]
     end
 
@@ -123,9 +128,12 @@ flowchart TB
     S --> SPEC
     M --> SPEC
     MD --> SPEC
-    SPEC --> NA
-    NA -->|draft code| TOOLS
-    TOOLS -->|write_notebook| NB
+    COORD -->|build_canonical_spec| SPEC
+    SPEC -->|canonical spec| COORD
+    COORD -->|delegates: spec + tables| NA
+    NA -->|draft code| COORD
+    COORD -->|write_notebook| TOOLS
+    TOOLS --> NB
     NB --> VA
     DB <--> VA
     VA -->|pass/fail + errors| COORD
@@ -138,11 +146,16 @@ flowchart TB
     PR -->|merge| HUMAN
 ```
 
-**Reading it left to right**: contracts feed a spec builder, which feeds an
-LLM that drafts code, which a zero-LLM rule engine checks. Omnigent's
-Coordinator agent sits on top of all of it, deciding when to retry, when to
-stop and ask a human because something looks like a genuine contract gap
-(not a code bug), and — always — pausing for your explicit approval before
+**Reading it left to right**: contracts feed a spec builder (a deterministic
+tool call, `build_canonical_spec` — zero LLM involved). The Coordinator
+delegates drafting to `notebook_drafter`, a sub-agent declared in the same
+`coordinator.yaml` file — a real Omnigent-dispatched LLM call, tracked and
+governed the same way the Coordinator's own turns are, not a separate API
+call hidden inside a Python tool. A completely separate zero-LLM rule
+engine is the real judge of whether the drafted code is correct. The
+Coordinator sits above all of it, deciding when to retry, when to stop and
+ask a human because something looks like a genuine contract gap (not a
+code bug), and — always — pausing for your explicit approval before
 touching git.
 
 ---
@@ -155,12 +168,12 @@ touching git.
 | `schemas/<entity>.yaml` | Raw column names/types as they actually exist in the source | Ground truth for what's really in the raw table |
 | `mappings/<entity>.yaml` | Field-by-field source→target rename + transform + cast | Tells the agent exactly what transformation is allowed — it must not invent its own |
 | `models/<entity>.yaml` | Target table shape: columns, types, primary key, nullability | What "done" looks like |
-| `orchestrator/canonical_spec.py` | Merges all four YAMLs into one `CanonicalSpecification` object | So the notebook agent and the validator share one interpretation, instead of each re-parsing four files independently and possibly disagreeing |
-| `agents/notebook_agent.py` | One Claude API call: given the canonical spec, write the DuckDB transformation script | The only LLM call in the code-generation path — deliberately narrow (system prompt forbids inventing casts/transforms not in the spec) |
+| `orchestrator/canonical_spec.py` | Merges all four YAMLs into one `CanonicalSpecification` object, exposed as the `build_canonical_spec` tool | So the notebook drafter and the validator share one interpretation, instead of each re-parsing four files independently and possibly disagreeing. Deterministic, zero LLM calls. |
+| `omnigent/coordinator.yaml`'s `notebook_drafter` sub-agent | A declared Omnigent sub-agent (`type: agent`) — given the canonical spec, writes the DuckDB transformation script | The only place an LLM judgment call belongs in code generation — deliberately narrow (its own prompt forbids inventing casts/transforms not in the spec), and dispatched *through* Omnigent, not via a separate hidden API call a Python tool makes on its own |
 | `validation/rules.py` | 8 deterministic checks (columns exist, types match, required/unique/allowed-values/format/constraint) | Zero LLM calls — this is the actual authority on pass/fail, not the agent's own opinion of its code |
 | `agents/validation_agent.py` | Runs the notebook as a subprocess, then runs the rules against the resulting table | Bridges "did the code even run" and "is the output correct" |
-| `tools/tools.py` | Guarded functions (`read_contract`, `write_notebook`, `run_duckdb`, `run_validation`, `generate_notebook_code`, ...), each scoped to one subdirectory | The only door into `data-domain` — rejects path traversal, rejects multi-statement/DDL SQL, rejects writes outside `notebooks/` |
-| `omnigent/coordinator.yaml` | The Omnigent agent definition: system prompt (the workflow, in prose) + the 8 tools above + the approval policy | Replaces a hand-written retry loop with an LLM that reasons about what to do next — including recognizing "this isn't a code bug, ask the human" |
+| `tools/tools.py` | Guarded functions (`read_contract`, `write_notebook`, `run_duckdb`, `run_validation`, `build_canonical_spec`, ...), each scoped to one subdirectory | The only door into `data-domain` — rejects path traversal, rejects multi-statement/DDL SQL, rejects writes outside `notebooks/`. Every function here is plain deterministic plumbing — no LLM calls live in this file. |
+| `omnigent/coordinator.yaml` | The Omnigent agent definition: main Coordinator (system prompt + tool list) + the `notebook_drafter` sub-agent + the approval policy, all in one file | Replaces a hand-written retry loop with an LLM that reasons about what to do next — including recognizing "this isn't a code bug, ask the human" — while keeping every LLM call in the system inside Omnigent's own governance |
 | `ask_on_os_tools` policy | Omnigent builtin; pauses for your approval before any shell/file-write action | The human-in-the-loop gate — since git/PR actions are the agent's only shell usage, this effectively gates "don't touch git without asking" for free, no custom code |
 
 ---
@@ -211,7 +224,7 @@ the end of §7 for what differs.
 
 ## 7. Installation, step by step (fresh machine)
 
-### 6.1 Clone both repos as siblings
+### 7.1 Clone both repos as siblings
 
 ```bash
 git clone <agent-platform-repo-url> agent-platform
@@ -220,7 +233,7 @@ git clone <data-domain-repo-url> data-domain
 # data-domain via a relative path (DOMAIN_REPO_PATH=../data-domain)
 ```
 
-### 6.2 Set up this repo's own Python environment
+### 7.2 Set up this repo's own Python environment
 
 ```bash
 cd agent-platform
@@ -234,7 +247,7 @@ ANTHROPIC_API_KEY=sk-...
 DOMAIN_REPO_PATH=../data-domain
 ```
 
-### 6.3 Set up the domain repo and seed test data
+### 7.3 Set up the domain repo and seed test data
 
 ```bash
 cd ../data-domain
@@ -244,7 +257,7 @@ python3 -m venv .venv
 .venv/bin/python data/load_raw_to_duckdb.py              # loads them into data/warehouse.duckdb
 ```
 
-### 6.4 Verify the pipeline works standalone (no Omnigent yet)
+### 7.4 Verify the pipeline works standalone (no Omnigent yet)
 
 ```bash
 cd ../agent-platform
@@ -257,13 +270,13 @@ print(run_validation('customer', 'raw_customers'))
 You should see 7 validation errors reported (the deliberately-broken rows) —
 that's the correct, expected result, not a failure.
 
-### 6.5 Install `uv` (no root needed)
+### 7.5 Install `uv` (no root needed)
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-### 6.6 Install Node.js 22 (two paths — pick based on whether you have `sudo`)
+### 7.6 Install Node.js 22 (two paths — pick based on whether you have `sudo`)
 
 **With `sudo`:**
 ```bash
@@ -283,14 +296,14 @@ corepack enable
 picks up `node`/`npm`/`pnpm` automatically afterward — you only need the
 `export NVM_DIR=...` line manually in a non-interactive/scripted shell.
 
-### 6.7 Install Omnigent
+### 7.7 Install Omnigent
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh
 ```
 Puts `omnigent` and `omni` on your PATH.
 
-### 6.8 Bundle this repo's dependencies into Omnigent's own environment
+### 7.8 Bundle this repo's dependencies into Omnigent's own environment
 
 **This step is easy to skip and will bite you later — see Known Issue #1.**
 
@@ -298,7 +311,7 @@ Puts `omnigent` and `omni` on your PATH.
 uv tool install omnigent --with duckdb --with pyyaml --with python-dotenv --with anthropic --force
 ```
 
-### 6.9 Configure credentials
+### 7.9 Configure credentials
 
 ```bash
 omnigent setup
@@ -306,7 +319,7 @@ omnigent setup
 Interactive picker — pick Anthropic / API key, point it at the key in
 `agent-platform/.env` if asked, confirm as default.
 
-### 6.10 Run the coordinator
+### 7.10 Run the coordinator
 
 ```bash
 cd ../data-domain
@@ -314,6 +327,125 @@ PYTHONPATH=/absolute/path/to/agent-platform omnigent run /absolute/path/to/agent
 ```
 See §8 for exactly why both of those things (working directory, `PYTHONPATH`)
 have to be set this way.
+
+### 7.11 Enabling the agent to branch, commit, and open a PR
+
+By default the Coordinator can draft and validate notebooks, but **cannot**
+actually touch git — three separate sandbox restrictions block it, all for
+good reasons individually, but all needing to be deliberately opened up
+for git/PR actions to work at all. This section is *why* each one exists
+and *how* to open it, safely, one piece at a time.
+
+**Why this needs configuring at all, instead of just working**: Omnigent
+runs the agent's shell/file tools inside a `bwrap` sandbox (Linux) for
+safety — by default that sandbox has no network access, hides most
+dotfiles/dotdirs (so a tool can't quietly read your SSH keys or shell
+history), and never mounts your home directory at all. Those are sensible
+defaults for an agent you don't fully trust yet. Git needs to reach
+github.com, needs its own `.git` folder to actually be visible and
+persistent, and needs a credential — so each of those three defaults has
+to be individually and deliberately relaxed, which is exactly what the
+`os_env.sandbox` block in `omnigent/coordinator.yaml` now does (see the
+comments inline in that file). The `ask_on_os_tools` policy stays on
+throughout — opening these up doesn't remove your approval gate, it only
+lets an *already-approved* git command actually succeed instead of failing
+partway through.
+
+#### Step 1 — Generate a token with the right permissions
+
+You need a GitHub token the agent can push and open PRs with. Two ways to
+get one:
+
+**Option A (simplest, reuses your own login)** — if you already use the
+`gh` CLI and are logged in:
+```bash
+gh auth status   # confirms you're logged in and shows the token's scopes
+```
+If `gh auth status` shows you're logged in with `repo` scope, you already
+have everything you need — skip to Step 2 and use `gh auth token` to read
+it. If not logged in yet:
+```bash
+gh auth login
+```
+Follow the prompts (browser or device code), choosing HTTPS and granting
+`repo` access when asked.
+
+**Option B (a dedicated, scoped-down token)** — better if you don't want
+the agent implicitly able to do everything your own `gh` login can:
+1. Go to [github.com/settings/tokens?type=beta](https://github.com/settings/tokens?type=beta)
+   (fine-grained personal access tokens).
+2. **Generate new token.** Give it a clear name (e.g. `omnigent-data-domain`)
+   and an expiration — short-lived is safer; you can regenerate later.
+3. **Repository access**: "Only select repositories" → pick
+   `shw-data/data-domain` specifically. Don't grant org-wide or all-repo
+   access for this.
+4. **Permissions** → **Repository permissions**: set **Contents** to
+   `Read and write` (needed to push commits/branches) and **Pull requests**
+   to `Read and write` (needed to open the PR itself). Leave everything
+   else at its default (`No access`).
+5. **Generate token**, and copy it immediately — GitHub only shows it once.
+
+Option B is the more correct choice for a real deployment (least
+privilege, scoped to exactly one repo); Option A is fine for a POC on your
+own machine.
+
+#### Step 2 — Put the token where the agent can reach it
+
+```bash
+echo "GH_TOKEN=$(gh auth token)" >> agent-platform/.env
+```
+(If you generated a token manually in Option B instead, replace
+`$(gh auth token)` with the token itself — paste it directly in place of
+that command substitution, e.g. `echo "GH_TOKEN=github_pat_..." >> agent-platform/.env`.)
+
+This must go in **`agent-platform/.env`** specifically — that's the file
+Omnigent's server actually loads from, not `data-domain/.env`.
+
+`gh`/git's credential helper checks the `GH_TOKEN` environment variable
+directly, which is why this works even though (per the "why" above)
+`$HOME` — where `gh` would normally look for its stored login — is never
+mounted into the sandbox at all.
+
+#### Step 3 — Confirm the sandbox config is in place
+
+Already done in this repo's `omnigent/coordinator.yaml` — for reference,
+or if you're setting this up in a new agent YAML from scratch, the
+`os_env.sandbox` block needs all three of:
+```yaml
+os_env:
+  sandbox:
+    type: linux_bwrap
+    write_paths:
+      - .
+    cwd_allow_hidden:
+      - .git          # otherwise .git is hidden/emptied on every shell call
+    allow_network: true   # otherwise git can't resolve github.com at all
+    env_passthrough:
+      - GH_TOKEN      # otherwise gh/git can't authenticate ($HOME isn't mounted)
+```
+
+#### Step 4 — Run it, loading the token into your shell first
+
+```bash
+omnigent stop
+
+cd ../data-domain
+set -a
+source ../agent-platform/.env
+set +a
+PYTHONPATH=/absolute/path/to/agent-platform omnigent run /absolute/path/to/agent-platform/omnigent/coordinator.yaml
+```
+
+The `set -a` / `source .env` / `set +a` sequence matters: a token sitting
+in `.env` on disk isn't automatically part of your shell's environment.
+Those three lines load every `KEY=value` line from `.env` into the actual
+shell session that starts the server — only then does `env_passthrough`
+have something real to forward into the sandbox.
+
+From here, ask the Coordinator to branch, commit, and open a PR as normal
+— the `ask_on_os_tools` policy still pauses for your approval before each
+shell action, same as always; the difference is that an approved action
+can now actually reach GitHub and authenticate.
 
 ### If you're on native Windows (no WSL)
 
@@ -350,7 +482,7 @@ starting point to try, not a guarantee.
 These aren't bugs in your setup — they're inherent to how Omnigent works,
 and anyone wiring a real codebase into it hits both.
 
-### 7.1 Function tools run inside Omnigent's own Python, not yours
+### 8.1 Function tools run inside Omnigent's own Python, not yours
 
 Your agent YAML says things like `callable: tools.tools.read_contract`.
 Omnigent resolves that with a plain `importlib.import_module` **inside the
@@ -367,7 +499,7 @@ installed by default, and doesn't know where `agent-platform/` is either.
 If a server was already running before you did this, `omnigent stop` first —
 a running server keeps the environment it started with.
 
-### 7.2 The sandbox won't let an agent work outside the folder you launched from
+### 8.2 The sandbox won't let an agent work outside the folder you launched from
 
 Whatever directory you're standing in when you type `omnigent run` becomes
 the agent's sandboxed working root (`os_env.cwd: .` in the YAML means
@@ -385,6 +517,41 @@ omnigent run /absolute/path/to/agent-platform/omnigent/coordinator.yaml   # the 
 mechanisms solving two different problems — you need both, together, every
 time.
 
+### 8.3 A tool that itself calls an LLM is a trap — use a sub-agent instead
+
+The first version of this repo's `notebook_drafter` step was a Python
+function tool (`generate_notebook_code`) that internally did its own
+`anthropic.Anthropic().messages.create(...)` call — a second, completely
+separate LLM call happening *inside* a tool, invisible to Omnigent
+entirely.
+
+It's an easy trap to fall into, especially when wiring an existing
+pre-Omnigent codebase in (which is exactly what happened here — this was
+literally the original standalone `agents/notebook_agent.py`, reused
+as-is). It works, but it's wrong for a system whose whole point is one
+governed conversation:
+
+- **No session tracking or cost tracking** — Omnigent's UI, logs, and cost
+  policies (`cost_budget`, `max_tool_calls_per_session`, etc.) have no idea
+  that second call ever happened.
+- **No policy enforcement** — any policy you'd write to gate/approve LLM
+  calls simply never sees it.
+- **A hardcoded model and credential**, bypassing whatever you configured
+  via `omnigent setup` — the tool's own `Anthropic()` client uses its own
+  environment/API key, not Omnigent's.
+- **The Coordinator can't reason about it** — it's a black box that
+  returns a string; the Coordinator has no visibility into what prompt was
+  actually used or why.
+
+**The fix**: declare it as a real Omnigent sub-agent instead —
+`type: agent` in the YAML, with its own `prompt:`, dispatched by the
+Coordinator the same way Omnigent's own examples (Polly's coding workers,
+the `reviewer` example in `AGENT_YAML_SPEC.md`) delegate to specialized
+workers. See `notebook_drafter` in `omnigent/coordinator.yaml` for the
+actual pattern used here. The rule of thumb: if a "tool" would need to
+import an LLM SDK and call it directly, it should almost always be a
+sub-agent instead, not a function tool.
+
 ---
 
 ## 9. Known issues and fixes
@@ -398,15 +565,14 @@ time.
 | `omnigent tool 'X': function-type tool has no resolved callable` | `PYTHONPATH` wasn't set (or got dropped) on the `omnigent run` command | Always glue `PYTHONPATH=/abs/path/to/agent-platform` directly onto the same line as `omnigent run ...` — a separate `export` line in some shells won't reliably persist into the command the way you'd expect |
 | `Failed to launch a runner ... requires path '...' which does not exist` or `workspace '...' is outside the agent's required path` | `os_env.cwd` in the YAML doesn't match, or points outside, the folder you launched from | Set `cwd: .` in the YAML and launch `omnigent run` from the actual target folder (§8.2) |
 | `config.yaml missing required field: spec_version` / `executor.config.harness: required when executor.type is 'omnigent'` | A file literally named `config.yaml` is loaded by a **different, stricter** parser (the one bundled examples like `examples/polly/config.yaml` use — nested `executor.type: omnigent` + `spec_version`), even if its content uses this project's simpler flat `executor.harness:` style | Don't name the agent file `config.yaml`. Any other name (`coordinator.yaml`, etc.) uses the flexible parser this project's YAML relies on. |
-| A tool call crashes with something like `TypeError: ... argument after ** must be a mapping, not str` | A tool parameter typed only as a bare `list`/`dict` (no explicit JSON schema) gets auto-inferred with no information about what's *inside* it — the LLM can invent the wrong shape (e.g. a list of strings instead of a list of `{rule, field, message}` objects) | Give that parameter an explicit `parameters:` JSON schema in the agent YAML (see `generate_notebook_code` in `omnigent/coordinator.yaml` for a worked example), and add a defensive type check in the wrapper function itself so a bad call fails with a clear, self-correctable message instead of a raw Python traceback |
+| A tool call crashes with something like `TypeError: ... argument after ** must be a mapping, not str` | A tool parameter typed only as a bare `list`/`dict` (no explicit JSON schema) gets auto-inferred with no information about what's *inside* it — the LLM can invent the wrong shape (e.g. a list of strings instead of a list of `{rule, field, message}` objects) | Give that parameter an explicit `parameters:` JSON schema in the agent YAML, and add a defensive type check in the wrapper function itself so a bad call fails with a clear, self-correctable message instead of a raw Python traceback. (This originally surfaced on a now-removed `generate_notebook_code` function tool — see §8.3 below for why that whole tool was replaced with a proper sub-agent instead of just schema-patched.) |
 | `omnigent setup` can't be scripted | It's an interactive arrow-key TUI wizard with no headless/`--non-interactive` flag | Run it yourself, interactively, in a real terminal — it can't be automated |
 | A secret appears in terminal output | `.env` had two variables jammed onto one line with no newline between them (e.g. from an earlier edit), so a `grep`/`cat` on one variable printed the whole line including the other | Keep `.env` one `KEY=value` pair per line; redact before printing (`sed 's/=.*/=<redacted>/'`) when showing anyone `.env`'s contents at all |
 | Agent reports fixing something but nothing changed on disk | A person tells the agent "I fixed it" referring to a **code** fix (e.g. in `agent-platform`), not a **data** fix — the agent correctly notices `data-domain`'s files are untouched and asks for clarification instead of assuming success | This is correct behavior, not a bug — clarify to the agent which repo/layer the fix was actually in. Also remember: the 8 deliberately-broken rows in the synthetic test data are *supposed* to stay broken and keep failing validation — that's the proof the deterministic gate works, not something to "fix" |
 | Validation reports the exact same 7 errors no matter how many times the notebook is rewritten, even when the new logic clearly should have changed the result | Two compounding bugs in the original `tools.py`: (1) `run_validation` only re-checked whatever table was already sitting in `warehouse.duckdb` — it never re-ran the notebook first, so it was always grading a stale table from whenever something was last manually executed; (2) `write_notebook("customer", code)` wrote to `notebooks/customer.py`, a different file from the one anything actually executes (`notebooks/customer_transformation.py`), so the "new" notebook was never the one being graded at all | Fixed in `tools.py`: `write_notebook`/`read_notebook` now use the entity's real filename (`<entity>_transformation.py`) via a shared `_notebook_filename()` helper, and `run_validation` now calls `agents.validation_agent.validate_notebook()` (which executes the notebook via subprocess, then checks the result) instead of only running the rule checks against whatever was already there. Verified by writing a notebook with an added dedup step and confirming the `uniqueness` error actually disappeared from the next `run_validation` call. |
 | Agent concludes "validation can never pass, the contract has no concept of dropping bad rows" and asks for a contract/schema change | Downstream symptom of the bug above — a stale, never-updated target table looks identical no matter what the notebook does, so a reasonable diagnosis is "the notebook's changes aren't being measured," and the agent generalized that (incorrectly) to "there's no mechanism for this at all" | Re-run the same request after the `tools.py` fix above (already applied in this repo) — the real mechanism exists (drop/normalize rows in the notebook's SQL, then `run_validation` checks the actual output), it just wasn't being exercised. This is also a good example of why the platform's rule is "ask the human rather than loop forever on an ambiguous failure" — the agent's stop-and-ask was the right call even though its root-cause theory was wrong; a human (or further investigation) was needed to find the real bug |
 | You fixed a bug in `tools.py`/`agents/`/`orchestrator/`, but the agent keeps behaving exactly as before, still diagnosing the *old* problem | Omnigent's server is a **long-running background process**. Function tools (`callable: dotted.path`) are imported once, in-process, the first time they're called (§8.1) — Python caches that import; editing the `.py` file on disk afterward does not change what's already loaded in a server that's still running | `omnigent stop`, then run `omnigent run ...` again — this starts a fresh server that re-imports your current code. There is no hot-reload; **any edit to this repo's Python code requires a server restart to take effect**, even mid-conversation. The old session/conversation is gone with the restart, so start the next message fresh rather than continuing the old thread. |
-| Agent's shell/git tools see an empty `.git` (no HEAD/objects/config) that resets on every command, and `git fetch`/`push` fail with `Could not resolve host: github.com` | Two separate sandbox behaviors in `os_env.sandbox` (`linux_bwrap`): (1) `allow_network: false` triggers bwrap's `--unshare-net`, cutting off all networking including DNS; (2) top-level dotdirs in the working folder are hidden/emptied inside the sandbox by default — only `.venv` is exempted out of the box, so `.git` gets masked on every single sandboxed shell call, meaning nothing persists between them | Set `allow_network: true` (the `ask_on_os_tools` policy is still the real safety gate — it already pauses for approval before any shell command runs, network or not) and add `cwd_allow_hidden: [".git"]` under `os_env.sandbox` in the agent YAML. Both are already set in this repo's `omnigent/coordinator.yaml`. |
-| Even with the above fixed, `git push`/`gh pr create` still fail on authentication | `$HOME` is **never** mounted into the sandbox, so `gh`'s stored credentials (`~/.config/gh/hosts.yml`) are unreachable from inside it, regardless of any other setting | Set `GH_TOKEN` as an environment variable instead — `gh` and git's credential helper both check `GH_TOKEN`/`GITHUB_TOKEN` directly, bypassing `$HOME` entirely. Add `GH_TOKEN=<a token from \`gh auth token\`>` to `agent-platform/.env`, and declare `env_passthrough: [GH_TOKEN]` under `os_env.sandbox` in the agent YAML (already declared in this repo's `omnigent/coordinator.yaml`) so it actually reaches the sandboxed process. |
+| Agent's shell/git tools see an empty `.git` (no HEAD/objects/config) that resets on every command, `git fetch`/`push` fail with `Could not resolve host: github.com`, or `git push`/`gh pr create` fail on authentication | Three separate sandbox defaults in `os_env.sandbox` (`linux_bwrap`), all deliberately relaxed in this repo's `coordinator.yaml` — see §7.11 for the full why/how | §7.11 walks through generating a token with the right scopes and configuring all three (`allow_network`, `cwd_allow_hidden: [".git"]`, `env_passthrough: [GH_TOKEN]`) — do that instead of patching around the symptom here. |
 
 ---
 
